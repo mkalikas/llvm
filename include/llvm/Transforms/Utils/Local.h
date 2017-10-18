@@ -1,4 +1,4 @@
-//===-- Local.h - Functions to perform local transformations ----*- C++ -*-===//
+//===- Local.h - Functions to perform local transformations -----*- C++ -*-===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -15,41 +15,44 @@
 #ifndef LLVM_TRANSFORMS_UTILS_LOCAL_H
 #define LLVM_TRANSFORMS_UTILS_LOCAL_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/IR/CallSite.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/User.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/Casting.h"
+#include <cstdint>
+#include <limits>
 
 namespace llvm {
 
-class User;
-class BasicBlock;
-class Function;
-class BranchInst;
-class Instruction;
-class CallInst;
-class DbgDeclareInst;
-class DbgInfoIntrinsic;
-class DbgValueInst;
-class StoreInst;
-class LoadInst;
-class Value;
-class PHINode;
 class AllocaInst;
 class AssumptionCache;
-class ConstantExpr;
-class DataLayout;
+class BasicBlock;
+class BranchInst;
+class CallInst;
+class DbgInfoIntrinsic;
+class DbgValueInst;
+class DIBuilder;
+class Function;
+class Instruction;
+class LazyValueInfo;
+class LoadInst;
+class MDNode;
+class PHINode;
+class StoreInst;
 class TargetLibraryInfo;
 class TargetTransformInfo;
-class DIBuilder;
-class DominatorTree;
-class LazyValueInfo;
-
-template<typename T> class SmallVectorImpl;
 
 /// A set of parameters used to control the transforms in the SimplifyCFG pass.
 /// Options may change depending on the position in the optimization pipeline.
@@ -59,12 +62,14 @@ struct SimplifyCFGOptions {
   int BonusInstThreshold;
   bool ConvertSwitchToLookupTable;
   bool NeedCanonicalLoop;
+  AssumptionCache *AC;
 
   SimplifyCFGOptions(int BonusThreshold = 1, bool SwitchToLookup = false,
-                     bool CanonicalLoops = true)
+                     bool CanonicalLoops = true,
+                     AssumptionCache *AssumpCache = nullptr)
       : BonusInstThreshold(BonusThreshold),
         ConvertSwitchToLookupTable(SwitchToLookup),
-        NeedCanonicalLoop(CanonicalLoops) {}
+        NeedCanonicalLoop(CanonicalLoops), AC(AssumpCache) {}
 };
 
 //===----------------------------------------------------------------------===//
@@ -79,8 +84,7 @@ struct SimplifyCFGOptions {
 /// conditions and indirectbr addresses this might make dead if
 /// DeleteDeadConditions is true.
 bool ConstantFoldTerminator(BasicBlock *BB, bool DeleteDeadConditions = false,
-                            const TargetLibraryInfo *TLI = nullptr,
-                            DominatorTree *DT = nullptr);
+                            const TargetLibraryInfo *TLI = nullptr);
 
 //===----------------------------------------------------------------------===//
 //  Local dead code elimination.
@@ -134,8 +138,7 @@ bool SimplifyInstructionsInBlock(BasicBlock *BB,
 ///
 /// .. and delete the predecessor corresponding to the '1', this will attempt to
 /// recursively fold the 'and' to 0.
-void RemovePredecessorAndSimplify(BasicBlock *BB, BasicBlock *Pred,
-                                  DominatorTree *DT = nullptr);
+void RemovePredecessorAndSimplify(BasicBlock *BB, BasicBlock *Pred);
 
 /// BB is a block with one predecessor and its predecessor is known to have one
 /// successor (BB!). Eliminate the edge between them, moving the instructions in
@@ -146,8 +149,7 @@ void MergeBasicBlockIntoOnlyPred(BasicBlock *BB, DominatorTree *DT = nullptr);
 /// other than PHI nodes, potential debug intrinsics and the branch. If
 /// possible, eliminate BB by rewriting all the predecessors to branch to the
 /// successor block and return true. If we can't transform, return false.
-bool TryToSimplifyUncondBranchFromEmptyBlock(BasicBlock *BB,
-                                             DominatorTree *DT = nullptr);
+bool TryToSimplifyUncondBranchFromEmptyBlock(BasicBlock *BB);
 
 /// Check for and eliminate duplicate PHI nodes in this block. This doesn't try
 /// to be clever about PHI nodes which differ only in the order of the incoming
@@ -160,8 +162,7 @@ bool EliminateDuplicatePHINodes(BasicBlock *BB);
 /// It returns true if a modification was made, possibly deleting the basic
 /// block that was pointed to. LoopHeaders is an optional input parameter
 /// providing the set of loop headers that SimplifyCFG should not eliminate.
-bool SimplifyCFG(BasicBlock *BB, const TargetTransformInfo &TTI,
-                 AssumptionCache *AC = nullptr,
+bool simplifyCFG(BasicBlock *BB, const TargetTransformInfo &TTI,
                  const SimplifyCFGOptions &Options = {},
                  SmallPtrSetImpl<BasicBlock *> *LoopHeaders = nullptr);
 
@@ -230,7 +231,8 @@ Value *EmitGEPOffset(IRBuilderTy *Builder, const DataLayout &DL, User *GEP,
 
   // Build a mask for high order bits.
   unsigned IntPtrWidth = IntPtrTy->getScalarType()->getIntegerBitWidth();
-  uint64_t PtrSizeMask = ~0ULL >> (64 - IntPtrWidth);
+  uint64_t PtrSizeMask =
+      std::numeric_limits<uint64_t>::max() >> (64 - IntPtrWidth);
 
   gep_type_iterator GTI = gep_type_begin(GEP);
   for (User::op_iterator i = GEP->op_begin() + 1, e = GEP->op_end(); i != e;
@@ -345,8 +347,7 @@ unsigned removeAllNonTerminatorAndEHPadInstructions(BasicBlock *BB);
 /// Insert an unreachable instruction before the specified
 /// instruction, making it and the rest of the code in the block dead.
 unsigned changeToUnreachable(Instruction *I, bool UseLLVMTrap,
-                             bool PreserveLCSSA = false,
-                             DominatorTree *DT = nullptr);
+                             bool PreserveLCSSA = false);
 
 /// Convert the CallInst to InvokeInst with the specified unwind edge basic
 /// block.  This also splits the basic block where CI is located, because
@@ -361,13 +362,12 @@ BasicBlock *changeToInvokeAndSplitBasicBlock(CallInst *CI,
 ///
 /// \param BB  Block whose terminator will be replaced.  Its terminator must
 ///            have an unwind successor.
-void removeUnwindEdge(BasicBlock *BB, DominatorTree *DT = nullptr);
+void removeUnwindEdge(BasicBlock *BB);
 
 /// Remove all blocks that can not be reached from the function's entry.
 ///
 /// Returns true if any basic block was removed.
-bool removeUnreachableBlocks(Function &F, LazyValueInfo *LVI = nullptr,
-                             DominatorTree *DT = nullptr);
+bool removeUnreachableBlocks(Function &F, LazyValueInfo *LVI = nullptr);
 
 /// Combine the metadata of two instructions so that K can replace J
 ///
@@ -392,7 +392,6 @@ unsigned replaceDominatedUsesWith(Value *From, Value *To, DominatorTree &DT,
 /// the end of the given BasicBlock. Returns the number of replacements made.
 unsigned replaceDominatedUsesWith(Value *From, Value *To, DominatorTree &DT,
                                   const BasicBlock *BB);
-
 
 /// Return true if the CallSite CS calls a gc leaf function.
 ///
@@ -455,6 +454,6 @@ void maybeMarkSanitizerLibraryCallNoBuiltin(CallInst *CI,
 /// value?
 bool canReplaceOperandWithVariable(const Instruction *I, unsigned OpIdx);
 
-} // End llvm namespace
+} // end namespace llvm
 
-#endif
+#endif // LLVM_TRANSFORMS_UTILS_LOCAL_H

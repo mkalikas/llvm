@@ -27,16 +27,17 @@ using namespace llvm::PatternMatch;
 /// The PHI arguments will be folded into a single operation with a PHI node
 /// as input. The debug location of the single operation will be the merged
 /// locations of the original PHI node arguments.
-DebugLoc InstCombiner::PHIArgMergedDebugLoc(PHINode &PN) {
+void InstCombiner::PHIArgMergedDebugLoc(Instruction *Inst, PHINode &PN) {
   auto *FirstInst = cast<Instruction>(PN.getIncomingValue(0));
-  const DILocation *Loc = FirstInst->getDebugLoc();
+  Inst->setDebugLoc(FirstInst->getDebugLoc());
+  // We do not expect a CallInst here, otherwise, N-way merging of DebugLoc
+  // will be inefficient.
+  assert(!isa<CallInst>(Inst));
 
   for (unsigned i = 1; i != PN.getNumIncomingValues(); ++i) {
     auto *I = cast<Instruction>(PN.getIncomingValue(i));
-    Loc = DILocation::getMergedLocation(Loc, I->getDebugLoc());
+    Inst->applyMergedLocation(Inst->getDebugLoc(), I->getDebugLoc());
   }
-
-  return Loc;
 }
 
 // Replace Integer typed PHI PN if the PHI's value is used as a pointer value.
@@ -179,11 +180,12 @@ Instruction *InstCombiner::FoldIntegerTypedPHI(PHINode &PN) {
   for (auto II = BB->begin(), EI = BasicBlock::iterator(BB->getFirstNonPHI());
        II != EI; II++) {
     PHINode *PtrPHI = dyn_cast<PHINode>(II);
-    if (!PtrPHI || PtrPHI == &PN)
+    if (!PtrPHI || PtrPHI == &PN || PtrPHI->getType() != IntToPtr->getType())
       continue;
     MatchingPtrPHI = PtrPHI;
     for (unsigned i = 0; i != PtrPHI->getNumIncomingValues(); ++i) {
-      if (AvailablePtrVals[i] != PtrPHI->getIncomingValue(i)) {
+      if (AvailablePtrVals[i] !=
+          PtrPHI->getIncomingValueForBlock(PN.getIncomingBlock(i))) {
         MatchingPtrPHI = nullptr;
         break;
       }
@@ -209,10 +211,20 @@ Instruction *InstCombiner::FoldIntegerTypedPHI(PHINode &PN) {
                   }))
     return nullptr;
 
+  // If any of the operand that requires casting is a terminator
+  // instruction, do not do it.
+  if (std::any_of(AvailablePtrVals.begin(), AvailablePtrVals.end(),
+                  [&](Value *V) {
+                    return (V->getType() != IntToPtr->getType()) &&
+                           isa<TerminatorInst>(V);
+                  }))
+    return nullptr;
+
   PHINode *NewPtrPHI = PHINode::Create(
       IntToPtr->getType(), PN.getNumIncomingValues(), PN.getName() + ".ptr");
 
   InsertNewInstBefore(NewPtrPHI, PN);
+  SmallDenseMap<Value *, Instruction *> Casts;
   for (unsigned i = 0; i != PN.getNumIncomingValues(); ++i) {
     auto *IncomingBB = PN.getIncomingBlock(i);
     auto *IncomingVal = AvailablePtrVals[i];
@@ -237,17 +249,20 @@ Instruction *InstCombiner::FoldIntegerTypedPHI(PHINode &PN) {
     // ==>
     // %v.ptrp = bitcast i64 * %a.ip to float **
     // %v.cast = load float *, float ** %v.ptrp, align 8
-    auto *CI = CastInst::CreateBitOrPointerCast(
-        IncomingVal, IntToPtr->getType(), IncomingVal->getName() + ".ptr");
-    if (auto *IncomingI = dyn_cast<Instruction>(IncomingVal)) {
-      BasicBlock::iterator InsertPos(IncomingI);
-      InsertPos++;
-      if (isa<PHINode>(IncomingI))
-        InsertPos = IncomingI->getParent()->getFirstInsertionPt();
-      InsertNewInstBefore(CI, *InsertPos);
-    } else {
-      auto *InsertBB = &IncomingBB->getParent()->getEntryBlock();
-      InsertNewInstBefore(CI, *InsertBB->getFirstInsertionPt());
+    Instruction *&CI = Casts[IncomingVal];
+    if (!CI) {
+      CI = CastInst::CreateBitOrPointerCast(IncomingVal, IntToPtr->getType(),
+                                            IncomingVal->getName() + ".ptr");
+      if (auto *IncomingI = dyn_cast<Instruction>(IncomingVal)) {
+        BasicBlock::iterator InsertPos(IncomingI);
+        InsertPos++;
+        if (isa<PHINode>(IncomingI))
+          InsertPos = IncomingI->getParent()->getFirstInsertionPt();
+        InsertNewInstBefore(CI, *InsertPos);
+      } else {
+        auto *InsertBB = &IncomingBB->getParent()->getEntryBlock();
+        InsertNewInstBefore(CI, *InsertBB->getFirstInsertionPt());
+      }
     }
     NewPtrPHI->addIncoming(CI, IncomingBB);
   }
@@ -335,7 +350,7 @@ Instruction *InstCombiner::FoldPHIArgBinOpIntoPHI(PHINode &PN) {
   if (CmpInst *CIOp = dyn_cast<CmpInst>(FirstInst)) {
     CmpInst *NewCI = CmpInst::Create(CIOp->getOpcode(), CIOp->getPredicate(),
                                      LHSVal, RHSVal);
-    NewCI->setDebugLoc(PHIArgMergedDebugLoc(PN));
+    PHIArgMergedDebugLoc(NewCI, PN);
     return NewCI;
   }
 
@@ -348,7 +363,7 @@ Instruction *InstCombiner::FoldPHIArgBinOpIntoPHI(PHINode &PN) {
   for (unsigned i = 1, e = PN.getNumIncomingValues(); i != e; ++i)
     NewBinOp->andIRFlags(PN.getIncomingValue(i));
 
-  NewBinOp->setDebugLoc(PHIArgMergedDebugLoc(PN));
+  PHIArgMergedDebugLoc(NewBinOp, PN);
   return NewBinOp;
 }
 
@@ -457,7 +472,7 @@ Instruction *InstCombiner::FoldPHIArgGEPIntoPHI(PHINode &PN) {
       GetElementPtrInst::Create(FirstInst->getSourceElementType(), Base,
                                 makeArrayRef(FixedOperands).slice(1));
   if (AllInBounds) NewGEP->setIsInBounds();
-  NewGEP->setDebugLoc(PHIArgMergedDebugLoc(PN));
+  PHIArgMergedDebugLoc(NewGEP, PN);
   return NewGEP;
 }
 
@@ -617,7 +632,7 @@ Instruction *InstCombiner::FoldPHIArgLoadIntoPHI(PHINode &PN) {
     for (Value *IncValue : PN.incoming_values())
       cast<LoadInst>(IncValue)->setVolatile(false);
 
-  NewLI->setDebugLoc(PHIArgMergedDebugLoc(PN));
+  PHIArgMergedDebugLoc(NewLI, PN);
   return NewLI;
 }
 
@@ -783,7 +798,7 @@ Instruction *InstCombiner::FoldPHIArgOpIntoPHI(PHINode &PN) {
   if (CastInst *FirstCI = dyn_cast<CastInst>(FirstInst)) {
     CastInst *NewCI = CastInst::Create(FirstCI->getOpcode(), PhiVal,
                                        PN.getType());
-    NewCI->setDebugLoc(PHIArgMergedDebugLoc(PN));
+    PHIArgMergedDebugLoc(NewCI, PN);
     return NewCI;
   }
 
@@ -794,14 +809,14 @@ Instruction *InstCombiner::FoldPHIArgOpIntoPHI(PHINode &PN) {
     for (unsigned i = 1, e = PN.getNumIncomingValues(); i != e; ++i)
       BinOp->andIRFlags(PN.getIncomingValue(i));
 
-    BinOp->setDebugLoc(PHIArgMergedDebugLoc(PN));
+    PHIArgMergedDebugLoc(BinOp, PN);
     return BinOp;
   }
 
   CmpInst *CIOp = cast<CmpInst>(FirstInst);
   CmpInst *NewCI = CmpInst::Create(CIOp->getOpcode(), CIOp->getPredicate(),
                                    PhiVal, ConstantOp);
-  NewCI->setDebugLoc(PHIArgMergedDebugLoc(PN));
+  PHIArgMergedDebugLoc(NewCI, PN);
   return NewCI;
 }
 

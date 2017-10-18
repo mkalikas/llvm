@@ -30,7 +30,8 @@ void CoveragePrinterText::closeViewFile(OwnedStream OS) {
 
 Error CoveragePrinterText::createIndexFile(
     ArrayRef<std::string> SourceFiles,
-    const coverage::CoverageMapping &Coverage, const CoverageFilter &Filters) {
+    const coverage::CoverageMapping &Coverage,
+    const CoverageFiltersMatchAll &Filters) {
   auto OSOrErr = createOutputStream("index", "txt", /*InToplevel=*/true);
   if (Error E = OSOrErr.takeError())
     return E;
@@ -147,7 +148,7 @@ void SourceCoverageViewText::renderLineCoverageColumn(
     OS.indent(LineCoverageColumnWidth) << '|';
     return;
   }
-  std::string C = formatCount(Line.ExecutionCount);
+  std::string C = formatCount(Line.getExecutionCount());
   OS.indent(LineCoverageColumnWidth - C.size());
   colored_ostream(OS, raw_ostream::MAGENTA,
                   Line.hasMultipleRegions() && getOptions().Colors)

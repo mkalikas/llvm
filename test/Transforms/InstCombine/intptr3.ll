@@ -1,6 +1,5 @@
 ; RUN: opt < %s  -instcombine -S | FileCheck %s
 
-
 define  void @test(float* %a, float* readnone %a_end, i64 %b) unnamed_addr  {
 entry:
   %cmp1 = icmp ult float* %a, %a_end
@@ -20,12 +19,15 @@ for.body:                                         ; preds = %for.body.preheader,
   %l = load float, float* %b.addr.float, align 4 
   %mul.i = fmul float %l, 4.200000e+01
   store float %mul.i, float* %a.addr.03, align 4
+; CHECK: store float
   %b.addr.float.2 = inttoptr i64 %b.addr.i64 to float*
 ; CHECK-NOT: inttoptr
   %b.addr.float.inc = getelementptr inbounds float, float* %b.addr.float.2, i64 1
+; CHECK: %b.addr.float.inc = 
   %b.addr.i64.inc = ptrtoint float* %b.addr.float.inc to i64
 ; CHECK-NOT: ptrtoint
   %incdec.ptr = getelementptr inbounds float, float* %a.addr.03, i64 1
+; CHECK: %incdec.ptr = 
   %cmp = icmp ult float* %incdec.ptr, %a_end
   br i1 %cmp, label %for.body, label %for.end
 
